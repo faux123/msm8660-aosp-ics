@@ -160,6 +160,10 @@ struct msm_hs_port {
 	enum msm_hs_clk_req_off_state_e clk_req_off_state;
 
 	struct msm_hs_wakeup wakeup;
+#ifdef CONFIG_SERIAL_BCM_BT_LPM
+	/* optional callback to exit low power mode */
+	void (*exit_lpm_cb)(struct uart_port *);
+#endif
 	struct wake_lock dma_wake_lock;  /* held while any DMA active */
 };
 
@@ -1088,6 +1092,11 @@ static void msm_hs_start_tx_locked(struct uart_port *uport )
 {
 	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
 
+#ifdef CONFIG_SERIAL_BCM_BT_LPM
+	if (msm_uport->exit_lpm_cb)
+		msm_uport->exit_lpm_cb(uport);
+#endif
+
 	if (msm_uport->tx.tx_ready_int_en == 0) {
 		msm_uport->tx.tx_ready_int_en = 1;
 		if (msm_uport->tx.dma_in_flight == 0)
@@ -1278,7 +1287,11 @@ static void msm_hs_handle_delta_cts_locked(struct uart_port *uport)
  *        -1 did not clock off, do not retry
  *         1 if we clocked off
  */
+#ifdef CONFIG_SERIAL_BCM_BT_LPM
+int msm_hs_check_clock_off_locked(struct uart_port *uport)
+#else
 static int msm_hs_check_clock_off_locked(struct uart_port *uport)
+#endif
 {
 	unsigned long sr_status;
 	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
@@ -1321,10 +1334,14 @@ static int msm_hs_check_clock_off_locked(struct uart_port *uport)
 		return 0;  /* come back later to really clock off */
 	}
 
+#ifdef CONFIG_SERIAL_BCM_BT_LPM
+	msm_hs_start_rx_locked(uport);
+#else
 	/* we really want to clock off */
 	clk_disable(msm_uport->clk);
 	if (msm_uport->pclk)
 		clk_disable(msm_uport->pclk);
+#endif
 	msm_uport->clk_state = MSM_HS_CLK_OFF;
 	if (use_low_power_wakeup(msm_uport)) {
 		msm_uport->wakeup.ignore = 1;
@@ -1446,11 +1463,10 @@ static irqreturn_t msm_hs_isr(int irq, void *dev)
 }
 
 /* request to turn off uart clock once pending TX is flushed */
-void msm_hs_request_clock_off(struct uart_port *uport) {
-	unsigned long flags;
+#ifdef CONFIG_SERIAL_BCM_BT_LPM
+void msm_hs_request_clock_off_locked(struct uart_port *uport) {
 	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
 
-	spin_lock_irqsave(&uport->lock, flags);
 	if (msm_uport->clk_state == MSM_HS_CLK_ON) {
 		msm_uport->clk_state = MSM_HS_CLK_REQUEST_OFF;
 		msm_uport->clk_req_off_state = CLK_REQ_OFF_START;
@@ -1462,11 +1478,44 @@ void msm_hs_request_clock_off(struct uart_port *uport) {
 		 */
 		mb();
 	}
+}
+EXPORT_SYMBOL(msm_hs_request_clock_off_locked);
+
+void msm_hs_request_clock_off(struct uart_port *uport) {
+	unsigned long flags;
+
+	spin_lock_irqsave(&uport->lock, flags);
+	msm_hs_request_clock_off_locked(uport);
 	spin_unlock_irqrestore(&uport->lock, flags);
 }
 EXPORT_SYMBOL(msm_hs_request_clock_off);
+#else
+void msm_hs_request_clock_off(struct uart_port *uport) {
+	unsigned long flags;
+	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
 
+	spin_lock_irqsave(&uport->lock, flags);
+	if (msm_uport->clk_state == MSM_HS_CLK_ON) {
+		msm_uport->clk_state = MSM_HS_CLK_REQUEST_OFF;
+		msm_uport->clk_req_off_state = CLK_REQ_OFF_START;
+		msm_uport->imr_reg |= UARTDM_ISR_TXLEVE_BMSK;
+		msm_hs_write(uport, UARTDM_IMR_ADDR, msm_uport->imr_reg);
+		/*
+		 * Complete device write before returning back.
+		 * Hence mb() required here.
+		 */
+		mb();
+	}
+	spin_unlock_irqrestore(&uport->lock, flags);
+}
+EXPORT_SYMBOL(msm_hs_request_clock_off);
+#endif
+
+#ifdef CONFIG_SERIAL_BCM_BT_LPM
+void msm_hs_request_clock_on_locked(struct uart_port *uport) {
+#else
 static void msm_hs_request_clock_on_locked(struct uart_port *uport) {
+#endif
 	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
 	unsigned int data;
 	int ret = 0;
@@ -1829,7 +1878,11 @@ static int __init msm_hs_probe(struct platform_device *pdev)
 	if (unlikely((int)uport->irq < 0))
 		return -ENXIO;
 
+#ifdef CONFIG_SERIAL_BCM_BT_LPM
+	if (pdata == NULL || pdata->wakeup_irq < 0)
+#else
 	if (pdata == NULL)
+#endif
 		msm_uport->wakeup.irq = -1;
 	else {
 		msm_uport->wakeup.irq = pdata->wakeup_irq;
@@ -1845,6 +1898,13 @@ static int __init msm_hs_probe(struct platform_device *pdev)
 				dev_err(uport->dev, "Cannot configure"
 					"gpios\n");
 	}
+
+#ifdef CONFIG_SERIAL_BCM_BT_LPM
+	if (pdata == NULL)
+		msm_uport->exit_lpm_cb = NULL;
+	else
+		msm_uport->exit_lpm_cb = pdata->exit_lpm_cb;
+#endif
 
 	resource = platform_get_resource_byname(pdev, IORESOURCE_DMA,
 						"uartdm_channels");

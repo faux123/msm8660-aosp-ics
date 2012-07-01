@@ -67,6 +67,7 @@
 #include <mach/msm_spi.h>
 #include <mach/msm_serial_hs.h>
 #include <mach/msm_serial_hs_lite.h>
+#include <mach/bcm_bt_lpm.h>
 #include <mach/msm_iomap.h>
 #include <mach/msm_memtypes.h>
 #include <asm/mach/mmc.h>
@@ -2293,9 +2294,25 @@ static int configure_uart_gpios(int on)
 }
 
 static struct msm_serial_hs_platform_data msm_uart_dm1_pdata = {
-	.inject_rx_on_wakeup = 1,
-	.rx_to_inject = 0xFD,
+	.wakeup_irq = -1,
+	.inject_rx_on_wakeup = 0,
 	.gpio_config = configure_uart_gpios,
+	.exit_lpm_cb = bcm_bt_lpm_exit_lpm_locked,
+};
+
+static struct bcm_bt_lpm_platform_data bcm_bt_lpm_pdata = {
+	.gpio_wake = PYRAMID_GPIO_BT_CHIP_WAKE,
+	.gpio_host_wake = PYRAMID_GPIO_BT_HOST_WAKE,
+	.request_clock_off_locked = msm_hs_request_clock_off_locked,
+	.request_clock_on_locked = msm_hs_request_clock_on_locked,
+};
+
+struct platform_device pyramid_bcm_bt_lpm_device = {
+	.name = "bcm_bt_lpm",
+	.id = 0,
+	.dev = {
+		.platform_data = &bcm_bt_lpm_pdata,
+	},
 };
 #endif
 
@@ -3307,6 +3324,7 @@ static struct platform_device *pyramid_devices[] __initdata = {
 #endif
 #ifdef CONFIG_SERIAL_MSM_HS
 	&msm_device_uart_dm1,
+	&pyramid_bcm_bt_lpm_device,
 #endif
 #ifdef CONFIG_MSM_SSBI
 	&msm_device_ssbi_pmic1,
@@ -4877,7 +4895,6 @@ static void __init msm8x60_init_buses(void)
 #endif
 
 #ifdef CONFIG_SERIAL_MSM_HS
-	msm_uart_dm1_pdata.wakeup_irq = gpio_to_irq(PYRAMID_GPIO_BT_HOST_WAKE);
 	msm_device_uart_dm1.dev.platform_data = &msm_uart_dm1_pdata;
 #endif
 
